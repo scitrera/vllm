@@ -29,6 +29,7 @@ from vllm import envs
 from vllm.config import ModelConfig
 from vllm.config.load import LoadConfig
 from vllm.distributed import get_tensor_model_parallel_rank
+from vllm.distributed.parallel_state import get_world_group
 from vllm.logger import init_logger
 from vllm.model_executor.layers.quantization import (
     QuantizationConfig,
@@ -773,14 +774,15 @@ def runai_safetensors_weights_iterator(
         yield from tensor_iter
 
 
-def _init_loader(
+def _init_fastsafetensors_loader(
     pg: torch.distributed.ProcessGroup,
     device: torch.device,
     f_list: list[str],
     *,
     nogds: bool = False,
+    disable_cache: bool = True,
 ):
-    loader = SafeTensorsFileLoader(pg, device, nogds=nogds)
+    loader = SafeTensorsFileLoader(pg, device, nogds=nogds, disable_cache=disable_cache)
     rank_file_map = {i: [f] for i, f in enumerate(f_list)}
     loader.add_filenames(rank_file_map)
     return loader
@@ -793,17 +795,24 @@ def fastsafetensors_weights_iterator(
     """Iterate over the weights in the model safetensor files
     using fastsafetensor library."""
     if torch.distributed.is_initialized():
-        pg = torch.distributed.group.WORLD
+        try:
+            world = get_world_group()   # will raise AssertionError if vLLM distributed is not initialized
+            pg = world.device_group
+            device = world.device
+        except AssertionError:
+            pg = torch.distributed.group.WORLD
+            device = torch.device(f"cuda:{torch.cuda.current_device()}")
     else:
         pg = SingleGroup()
+        device = torch.device(f"cuda:{pg.rank()}")
 
-    device = torch.device(f"cuda:{pg.rank()}")
     weight_files_sub_lists = [
         hf_weights_files[i : i + pg.size()]
         for i in range(0, len(hf_weights_files), pg.size())
     ]
 
     nogds = False
+    disable_cache = True
 
     for f_list in tqdm(
         weight_files_sub_lists,
@@ -811,7 +820,7 @@ def fastsafetensors_weights_iterator(
         disable=not enable_tqdm(use_tqdm_on_load),
         bar_format=_BAR_FORMAT,
     ):
-        loader = _init_loader(pg, device, f_list, nogds=nogds)
+        loader = _init_fastsafetensors_loader(pg, device, f_list, nogds=nogds, disable_cache=disable_cache)
         try:
             try:
                 fb = loader.copy_files_to_device()
@@ -825,7 +834,7 @@ def fastsafetensors_weights_iterator(
                     "GDS not enabled, setting `nogds=True`.\n"
                     "For more information, see: https://github.com/foundation-model-stack/fastsafetensors?tab=readme-ov-file#basic-api-usages"
                 )
-                loader = _init_loader(pg, device, f_list, nogds=nogds)
+                loader = _init_fastsafetensors_loader(pg, device, f_list, nogds=nogds, disable_cache=disable_cache)
                 fb = loader.copy_files_to_device()
 
             try:
